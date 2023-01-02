@@ -15,6 +15,17 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf xdp/xdp.c -- -I./xdp/headers
 
+/*
+#include <time.h>
+static unsigned long long get_nsecs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000UL + ts.tv_nsec;
+}
+*/
+import "C"
+
 type V4TupleC struct {
 	SrcAddr uint32
 	DstAddr uint32
@@ -55,6 +66,7 @@ type V4CTC struct {
 	InnerPort uint16
 	OuterPort uint16
 	PktCount  uint32
+	KTime     uint64
 }
 
 type V4CT struct {
@@ -63,6 +75,7 @@ type V4CT struct {
 	InnerPort uint16
 	OuterPort uint16
 	PktCount  uint32
+	KTime     int64
 }
 
 func (v V4CTC) ToGo() V4CT {
@@ -70,6 +83,7 @@ func (v V4CTC) ToGo() V4CT {
 		InnerPort: v.InnerPort,
 		OuterPort: v.OuterPort,
 		PktCount:  v.PktCount,
+		KTime:     int64(v.KTime),
 	}
 
 	res.InnerAddr = Uint32ToIPv4(v.InnerAddr)
@@ -159,6 +173,8 @@ func main() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
+		unix_nano := int64(C.get_nsecs())
+		expiredKey := make([]V4TupleC, 0)
 		t, err := readNatTable(objs.Inner2outerV4Tcp)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
@@ -168,10 +184,23 @@ func main() {
 		for kc, vc := range t {
 			k := kc.ToGo()
 			v := vc.ToGo()
+			elapsed_nano := unix_nano - v.KTime
+			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
 			log.Printf(" srcAddr=%s:%d dstAddr=%s:%d =>\n", k.SrcAddr, k.SrcPort, k.DstAddr, k.DstPort)
-			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount)
+			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
+			if elapsed_sec > 10 {
+				expiredKey = append(expiredKey, kc)
+			}
 		}
 
+		for _, kc := range expiredKey {
+			err = objs.Inner2outerV4Tcp.Delete(kc)
+			if err != nil {
+				log.Printf("failed to delete key %q from inner2outer err=%s", kc, err)
+			}
+		}
+
+		expiredKey = make([]V4TupleC, 0)
 		t, err = readNatTable(objs.Outer2innerV4Tcp)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
@@ -181,8 +210,20 @@ func main() {
 		for kc, vc := range t {
 			k := kc.ToGo()
 			v := vc.ToGo()
+			elapsed_nano := unix_nano - v.KTime
+			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
 			log.Printf(" srcAddr=%s:%d dstAddr=%s:%d =>\n", k.SrcAddr, k.SrcPort, k.DstAddr, k.DstPort)
-			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount)
+			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
+			if elapsed_sec > 10 {
+				expiredKey = append(expiredKey, kc)
+			}
+		}
+
+		for _, kc := range expiredKey {
+			err = objs.Outer2innerV4Tcp.Delete(kc)
+			if err != nil {
+				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
+			}
 		}
 	}
 }

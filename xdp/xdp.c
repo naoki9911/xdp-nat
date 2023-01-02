@@ -47,6 +47,7 @@ struct v4_ct
 	__u16 inner_port;
 	__u16 outer_port;
 	__u32 pkt_count;
+	__u64 ktime;
 };
 
 struct bpf_map_def SEC("maps") inner2outer_v4_tcp = {
@@ -235,6 +236,7 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			ct.inner_port = bpf_ntohs(tcphdr->source);
 			ct.outer_port = outer_port;
 			ct.pkt_count = 0;
+			ct.ktime = bpf_ktime_get_ns();
 			res = bpf_map_update_elem(&inner2outer_v4_tcp, &t, &ct, BPF_ANY);
 			if (res < 0)
 			{
