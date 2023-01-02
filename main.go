@@ -27,17 +27,14 @@ static unsigned long long get_nsecs(void)
 import "C"
 
 type V4TupleC struct {
-	SrcAddr uint32
-	DstAddr uint32
-	SrcPort uint16
-	DstPort uint16
+	Addr    uint32
+	Port    uint16
+	Padding uint16
 }
 
 type V4Tuple struct {
-	SrcAddr net.IP
-	DstAddr net.IP
-	SrcPort uint16
-	DstPort uint16
+	Addr net.IP
+	Port uint16
 }
 
 func Uint32ToIPv4(a uint32) net.IP {
@@ -51,43 +48,62 @@ func IPv4ToUint32(a net.IP) uint32 {
 
 func (v V4TupleC) ToGo() V4Tuple {
 	res := V4Tuple{
-		SrcPort: v.SrcPort,
-		DstPort: v.DstPort,
+		Port: v.Port,
 	}
-	res.SrcAddr = Uint32ToIPv4(v.SrcAddr)
-	res.DstAddr = Uint32ToIPv4(v.DstAddr)
+	res.Addr = Uint32ToIPv4(v.Addr)
 
 	return res
 }
 
 type V4CTC struct {
-	InnerAddr uint32
-	OuterAddr uint32
-	InnerPort uint16
-	OuterPort uint16
-	PktCount  uint32
-	KTime     uint64
+	InnerAddr   uint32
+	OuterAddr   uint32
+	EndAddr     uint32
+	InnerPort   uint16
+	OuterPort   uint16
+	EndPort     uint16
+	Type        uint16
+	PktCount    uint32
+	KTime       uint64
+	InnerSrcMAC [6]byte
+	InnerDstMAC [6]byte
+	OuterSrcMAC [6]byte
+	OuterDstMAC [6]byte
 }
 
 type V4CT struct {
-	InnerAddr net.IP
-	OuterAddr net.IP
-	InnerPort uint16
-	OuterPort uint16
-	PktCount  uint32
-	KTime     int64
+	InnerAddr   net.IP
+	OuterAddr   net.IP
+	EndAddr     net.IP
+	InnerPort   uint16
+	OuterPort   uint16
+	EndPort     uint16
+	Type        uint16
+	PktCount    uint32
+	KTime       int64
+	InnerSrcMAC net.HardwareAddr
+	InnerDstMAC net.HardwareAddr
+	OuterSrcMAC net.HardwareAddr
+	OuterDstMAC net.HardwareAddr
 }
 
 func (v V4CTC) ToGo() V4CT {
 	res := V4CT{
-		InnerPort: v.InnerPort,
-		OuterPort: v.OuterPort,
-		PktCount:  v.PktCount,
-		KTime:     int64(v.KTime),
+		InnerPort:   v.InnerPort,
+		OuterPort:   v.OuterPort,
+		EndPort:     v.EndPort,
+		Type:        v.Type,
+		PktCount:    v.PktCount,
+		KTime:       int64(v.KTime),
+		InnerSrcMAC: v.InnerSrcMAC[0:],
+		InnerDstMAC: v.InnerDstMAC[0:],
+		OuterSrcMAC: v.OuterSrcMAC[0:],
+		OuterDstMAC: v.OuterDstMAC[0:],
 	}
 
 	res.InnerAddr = Uint32ToIPv4(v.InnerAddr)
 	res.OuterAddr = Uint32ToIPv4(v.OuterAddr)
+	res.EndAddr = Uint32ToIPv4(v.EndAddr)
 
 	return res
 }
@@ -174,7 +190,8 @@ func main() {
 	defer ticker.Stop()
 	for range ticker.C {
 		unix_nano := int64(C.get_nsecs())
-		expiredKey := make([]V4TupleC, 0)
+		expiredKeyI2O := make([]V4TupleC, 0)
+		expiredKeyO2I := make([]V4TupleC, 0)
 		t, err := readNatTable(objs.Inner2outerV4Tcp)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
@@ -186,21 +203,19 @@ func main() {
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
 			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
-			log.Printf(" srcAddr=%s:%d dstAddr=%s:%d =>\n", k.SrcAddr, k.SrcPort, k.DstAddr, k.DstPort)
-			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
+			log.Printf(" InnerAddr=%s:%d =>", k.Addr, k.Port)
+			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d endAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.EndAddr, v.EndPort, v.PktCount, elapsed_sec)
+			log.Printf("   innerSrcMAC=%s innerDstMAC=%s outerSrcMAC=%s outerDstMAC=%s\n", v.InnerSrcMAC, v.InnerDstMAC, v.OuterSrcMAC, v.OuterDstMAC)
 			if elapsed_sec > 10 {
-				expiredKey = append(expiredKey, kc)
+				expiredKeyI2O = append(expiredKeyI2O, kc)
+				k2 := V4TupleC{
+					Addr: vc.OuterAddr,
+					Port: vc.OuterPort,
+				}
+				expiredKeyO2I = append(expiredKeyO2I, k2)
 			}
 		}
 
-		for _, kc := range expiredKey {
-			err = objs.Inner2outerV4Tcp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from inner2outer err=%s", kc, err)
-			}
-		}
-
-		expiredKey = make([]V4TupleC, 0)
 		t, err = readNatTable(objs.Outer2innerV4Tcp)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
@@ -212,14 +227,17 @@ func main() {
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
 			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
-			log.Printf(" srcAddr=%s:%d dstAddr=%s:%d =>\n", k.SrcAddr, k.SrcPort, k.DstAddr, k.DstPort)
+			log.Printf(" OuterAddr=%s:%d =>", k.Addr, k.Port)
 			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
-			if elapsed_sec > 10 {
-				expiredKey = append(expiredKey, kc)
-			}
 		}
 
-		for _, kc := range expiredKey {
+		for _, kc := range expiredKeyI2O {
+			err = objs.Inner2outerV4Tcp.Delete(kc)
+			if err != nil {
+				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
+			}
+		}
+		for _, kc := range expiredKeyO2I {
 			err = objs.Outer2innerV4Tcp.Delete(kc)
 			if err != nil {
 				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)

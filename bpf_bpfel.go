@@ -54,7 +54,6 @@ type bpfSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfProgramSpecs struct {
-	XdpIcmpEchoFunc       *ebpf.ProgramSpec `ebpf:"xdp_icmp_echo_func"`
 	XdpNatInner2outerFunc *ebpf.ProgramSpec `ebpf:"xdp_nat_inner2outer_func"`
 	XdpNatOuter2innerFunc *ebpf.ProgramSpec `ebpf:"xdp_nat_outer2inner_func"`
 }
@@ -110,14 +109,12 @@ func (m *bpfMaps) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfPrograms struct {
-	XdpIcmpEchoFunc       *ebpf.Program `ebpf:"xdp_icmp_echo_func"`
 	XdpNatInner2outerFunc *ebpf.Program `ebpf:"xdp_nat_inner2outer_func"`
 	XdpNatOuter2innerFunc *ebpf.Program `ebpf:"xdp_nat_outer2inner_func"`
 }
 
 func (p *bpfPrograms) Close() error {
 	return _BpfClose(
-		p.XdpIcmpEchoFunc,
 		p.XdpNatInner2outerFunc,
 		p.XdpNatOuter2innerFunc,
 	)
