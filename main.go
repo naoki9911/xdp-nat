@@ -56,49 +56,53 @@ func (v V4TupleC) ToGo() V4Tuple {
 }
 
 type V4CTC struct {
+	InnerSrcMAC [6]byte
+	InnerDstMAC [6]byte
+	OuterSrcMAC [6]byte
+	OuterDstMAC [6]byte
 	InnerAddr   uint32
 	OuterAddr   uint32
 	EndAddr     uint32
 	InnerPort   uint16
 	OuterPort   uint16
 	EndPort     uint16
-	Type        uint16
+	Padding     uint16
 	PktCount    uint32
 	KTime       uint64
-	InnerSrcMAC [6]byte
-	InnerDstMAC [6]byte
-	OuterSrcMAC [6]byte
-	OuterDstMAC [6]byte
+	Type        uint16
+	State       uint16
 }
 
 type V4CT struct {
+	InnerSrcMAC net.HardwareAddr
+	InnerDstMAC net.HardwareAddr
+	OuterSrcMAC net.HardwareAddr
+	OuterDstMAC net.HardwareAddr
 	InnerAddr   net.IP
 	OuterAddr   net.IP
 	EndAddr     net.IP
 	InnerPort   uint16
 	OuterPort   uint16
 	EndPort     uint16
-	Type        uint16
 	PktCount    uint32
 	KTime       int64
-	InnerSrcMAC net.HardwareAddr
-	InnerDstMAC net.HardwareAddr
-	OuterSrcMAC net.HardwareAddr
-	OuterDstMAC net.HardwareAddr
+	Type        uint16
+	State       uint16
 }
 
 func (v V4CTC) ToGo() V4CT {
 	res := V4CT{
-		InnerPort:   v.InnerPort,
-		OuterPort:   v.OuterPort,
-		EndPort:     v.EndPort,
-		Type:        v.Type,
-		PktCount:    v.PktCount,
-		KTime:       int64(v.KTime),
 		InnerSrcMAC: v.InnerSrcMAC[0:],
 		InnerDstMAC: v.InnerDstMAC[0:],
 		OuterSrcMAC: v.OuterSrcMAC[0:],
 		OuterDstMAC: v.OuterDstMAC[0:],
+		InnerPort:   v.InnerPort,
+		OuterPort:   v.OuterPort,
+		EndPort:     v.EndPort,
+		PktCount:    v.PktCount,
+		KTime:       int64(v.KTime),
+		Type:        v.Type,
+		State:       v.State,
 	}
 
 	res.InnerAddr = Uint32ToIPv4(v.InnerAddr)
@@ -205,7 +209,7 @@ func main() {
 			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
 			log.Printf(" InnerAddr=%s:%d =>", k.Addr, k.Port)
 			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d endAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.EndAddr, v.EndPort, v.PktCount, elapsed_sec)
-			log.Printf("   innerSrcMAC=%s innerDstMAC=%s outerSrcMAC=%s outerDstMAC=%s\n", v.InnerSrcMAC, v.InnerDstMAC, v.OuterSrcMAC, v.OuterDstMAC)
+			log.Printf("   innerSrcMAC=%s innerDstMAC=%s outerSrcMAC=%s outerDstMAC=%s State=%d\n", v.InnerSrcMAC, v.InnerDstMAC, v.OuterSrcMAC, v.OuterDstMAC, v.State)
 			if elapsed_sec > 10 {
 				expiredKeyI2O = append(expiredKeyI2O, kc)
 				k2 := V4TupleC{
