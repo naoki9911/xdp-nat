@@ -17,6 +17,10 @@
 #define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
 #endif
 
+#ifndef memset
+#define memset(dest, v, n) __builtin_memset((dest), v, n)
+#endif
+
 struct config
 {
 	__u16 inner_if_index;
@@ -234,7 +238,7 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			return XDP_PASS;
 		}
 
-		__builtin_memset(&t, 0, sizeof(t));
+		memset(&t, 0, sizeof(t));
 		t.addr = iphdr->saddr;
 		t.port = bpf_ntohs(tcphdr->source);
 
@@ -251,7 +255,7 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			{
 				return XDP_PASS;
 			}
-			__builtin_memset(&fib_params, 0, sizeof(fib_params));
+			memset(&fib_params, 0, sizeof(fib_params));
 			fib_params.family = AF_INET;
 			fib_params.tos = iphdr->tos;
 			fib_params.l4_protocol = iphdr->protocol;
@@ -269,7 +273,7 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			}
 
 			struct v4_ct ct_new;
-			__builtin_memset(&ct_new, 0, sizeof(ct_new));
+			memset(&ct_new, 0, sizeof(ct_new));
 			ct_new.inner_addr = iphdr->saddr;
 			ct_new.outer_addr = c->outer_addr;
 			ct_new.end_addr = iphdr->daddr;
@@ -290,7 +294,7 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 				return XDP_DROP;
 			}
 
-			__builtin_memset(&t2, 0, sizeof(t2));
+			memset(&t2, 0, sizeof(t2));
 			t2.addr = ct_new.outer_addr;
 			t2.port = ct_new.outer_port;
 			res = bpf_map_update_elem(&outer2inner_v4_tcp, &t2, &ct_new, BPF_ANY);
@@ -409,7 +413,7 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 		{
 			return XDP_PASS;
 		}
-		__builtin_memset(&t, 0, sizeof(t));
+		memset(&t, 0, sizeof(t));
 		t.addr = iphdr->daddr;
 		t.port = bpf_ntohs(tcphdr->dest);
 		struct v4_ct *ct = (struct v4_ct *)bpf_map_lookup_elem(&outer2inner_v4_tcp, &t);
