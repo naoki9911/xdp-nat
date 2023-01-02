@@ -63,6 +63,13 @@ struct bpf_map_def SEC("maps") outer2inner_v4_tcp = {
 	.max_entries = 1024,
 };
 
+struct bpf_map_def SEC("maps") reserved_port_v4_tcp = {
+	.type = BPF_MAP_TYPE_QUEUE,
+	.key_size = 0,
+	.value_size = sizeof(__u16),
+	.max_entries = 256
+};
+
 static __always_inline __u16 csum_fold_helper(__u32 csum)
 {
 	return ~((csum & 0xffff) + (csum >> 16));
@@ -210,29 +217,41 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			return XDP_PASS;
 		}
 
+		__u16 outer_port = 0;
+		rc = bpf_map_pop_elem(&reserved_port_v4_tcp, &outer_port);
+		if (rc < 0) {
+			return XDP_PASS;
+		}
+
 		t.src_addr = iphdr->saddr;
 		t.dst_addr = iphdr->daddr;
 		t.src_port = bpf_ntohs(tcphdr->source);
 		t.dst_port = bpf_ntohs(tcphdr->dest);
-		ct.inner_addr = iphdr->saddr;
-		ct.outer_addr = c->outer_addr;
-		ct.inner_port = bpf_ntohs(tcphdr->source);
-		ct.outer_port = 10000;
-		ct.pkt_count = 0;
-		res = bpf_map_update_elem(&inner2outer_v4_tcp, &t, &ct, BPF_ANY);
-		if (res < 0)
-		{
-			return XDP_DROP;
-		}
 
-		t2.src_addr = iphdr->daddr;
-		t2.dst_addr = ct.outer_addr;
-		t2.src_port = t.dst_port;
-		t2.dst_port = ct.outer_port;
-		res = bpf_map_update_elem(&outer2inner_v4_tcp, &t2, &ct, BPF_ANY);
-		if (res < 0)
-		{
-			return XDP_DROP;
+		struct v4_ct *tmp = (struct v4_ct *)bpf_map_lookup_elem(&inner2outer_v4_tcp, &t);
+		if (tmp == NULL) {
+			ct.inner_addr = iphdr->saddr;
+			ct.outer_addr = c->outer_addr;
+			ct.inner_port = bpf_ntohs(tcphdr->source);
+			ct.outer_port = outer_port;
+			ct.pkt_count = 0;
+			res = bpf_map_update_elem(&inner2outer_v4_tcp, &t, &ct, BPF_ANY);
+			if (res < 0)
+			{
+				return XDP_DROP;
+			}
+
+			t2.src_addr = iphdr->daddr;
+			t2.dst_addr = ct.outer_addr;
+			t2.src_port = t.dst_port;
+			t2.dst_port = ct.outer_port;
+			res = bpf_map_update_elem(&outer2inner_v4_tcp, &t2, &ct, BPF_ANY);
+			if (res < 0)
+			{
+				return XDP_DROP;
+			}
+		} else {
+			ct = *tmp;
 		}
 
 		memcpy(ethhdr->h_source, fib_params.smac, ETH_ALEN);

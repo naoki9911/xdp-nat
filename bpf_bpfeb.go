@@ -63,10 +63,11 @@ type bpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type bpfMapSpecs struct {
-	Configs          *ebpf.MapSpec `ebpf:"configs"`
-	Inner2outerV4Tcp *ebpf.MapSpec `ebpf:"inner2outer_v4_tcp"`
-	Outer2innerV4Tcp *ebpf.MapSpec `ebpf:"outer2inner_v4_tcp"`
-	XdpStatsMap      *ebpf.MapSpec `ebpf:"xdp_stats_map"`
+	Configs           *ebpf.MapSpec `ebpf:"configs"`
+	Inner2outerV4Tcp  *ebpf.MapSpec `ebpf:"inner2outer_v4_tcp"`
+	Outer2innerV4Tcp  *ebpf.MapSpec `ebpf:"outer2inner_v4_tcp"`
+	ReservedPortV4Tcp *ebpf.MapSpec `ebpf:"reserved_port_v4_tcp"`
+	XdpStatsMap       *ebpf.MapSpec `ebpf:"xdp_stats_map"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -88,10 +89,11 @@ func (o *bpfObjects) Close() error {
 //
 // It can be passed to loadBpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type bpfMaps struct {
-	Configs          *ebpf.Map `ebpf:"configs"`
-	Inner2outerV4Tcp *ebpf.Map `ebpf:"inner2outer_v4_tcp"`
-	Outer2innerV4Tcp *ebpf.Map `ebpf:"outer2inner_v4_tcp"`
-	XdpStatsMap      *ebpf.Map `ebpf:"xdp_stats_map"`
+	Configs           *ebpf.Map `ebpf:"configs"`
+	Inner2outerV4Tcp  *ebpf.Map `ebpf:"inner2outer_v4_tcp"`
+	Outer2innerV4Tcp  *ebpf.Map `ebpf:"outer2inner_v4_tcp"`
+	ReservedPortV4Tcp *ebpf.Map `ebpf:"reserved_port_v4_tcp"`
+	XdpStatsMap       *ebpf.Map `ebpf:"xdp_stats_map"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -99,6 +101,7 @@ func (m *bpfMaps) Close() error {
 		m.Configs,
 		m.Inner2outerV4Tcp,
 		m.Outer2innerV4Tcp,
+		m.ReservedPortV4Tcp,
 		m.XdpStatsMap,
 	)
 }

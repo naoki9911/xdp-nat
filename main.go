@@ -114,16 +114,6 @@ func main() {
 	}
 	defer objs.Close()
 
-	// Attach the program.
-	l, err := link.AttachXDP(link.XDPOptions{
-		Program:   objs.XdpNatInner2outerFunc,
-		Interface: innerIf.Index,
-	})
-	if err != nil {
-		log.Fatalf("could not attach XDP program: %s", err)
-	}
-	defer l.Close()
-
 	config := ConfigC{
 		InnerIfIndex: uint16(innerIf.Index),
 		OuterIfIndex: uint16(outerIf.Index),
@@ -134,6 +124,25 @@ func main() {
 	if err != nil {
 		log.Fatalf("could not put config: %s", err)
 	}
+
+	port_i := uint16(10000)
+	for port_i < 10100 {
+		err = objs.ReservedPortV4Tcp.Put(nil, port_i)
+		if err != nil {
+			log.Fatalf("could not put reserved port: %s", err)
+		}
+		port_i += 1
+	}
+
+	// Attach the program.
+	l, err := link.AttachXDP(link.XDPOptions{
+		Program:   objs.XdpNatInner2outerFunc,
+		Interface: innerIf.Index,
+	})
+	if err != nil {
+		log.Fatalf("could not attach XDP program: %s", err)
+	}
+	defer l.Close()
 
 	l2, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpNatOuter2innerFunc,
