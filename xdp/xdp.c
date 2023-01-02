@@ -39,9 +39,15 @@ struct v4_tuple
 	__u16 padding;
 };
 
-#define NAT_TYPE_SYMMETRIC (__u16)1
+enum nat_type
+{
+	NAT_TYPE_SYMMETRIC,
+	NAT_TYPE_CONE_FULL,
+	NAT_TYPE_CONE_ADDRESS_RESTRICTED,
+	NAT_TYPE_CONE_PORT_RESTRICTED,
+};
 
-enum NAT_STATE_TCP
+enum nat_state_tcp
 {
 	NAT_STATE_TCP_RECV_SYN,
 	NAT_STATE_TCP_RECV_SYN_ACK,

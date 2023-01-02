@@ -246,7 +246,13 @@ func main() {
 			if err != nil {
 				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
 			}
+
+			err = objs.ReservedPortV4Tcp.Put(nil, kc.Port)
+			if err != nil {
+				log.Fatalf("could not put reserved port: %s", err)
+			}
 		}
+
 	}
 }
 
