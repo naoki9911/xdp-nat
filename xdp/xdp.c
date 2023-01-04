@@ -80,12 +80,18 @@ struct v4_ct
 	__u16 outer_port;
 
 	__u16 end_port;
-	__u16 padding;
-	__u32 pkt_count;
+	__u16 type; // symmetric or cone?
+	__u32 padding;
 
 	__u64 ktime;
-	__u16 type; // symmetric or cone?
+	__u64 pkt_count;
+	__u64 oct_count;
+};
+
+struct state
+{
 	__u16 state;
+	// struct bpf_spin_lock lock;
 };
 
 struct bpf_map_def SEC("maps") inner2outer_v4_tcp = {
@@ -102,7 +108,34 @@ struct bpf_map_def SEC("maps") outer2inner_v4_tcp = {
 	.max_entries = 1024,
 };
 
+struct bpf_map_def SEC("maps") state_v4_tcp = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(struct v4_tuple),
+	.value_size = sizeof(struct state),
+	.max_entries = 1024,
+};
+
 struct bpf_map_def SEC("maps") reserved_port_v4_tcp = {
+	.type = BPF_MAP_TYPE_QUEUE,
+	.key_size = 0,
+	.value_size = sizeof(__u16),
+	.max_entries = 256};
+
+struct bpf_map_def SEC("maps") inner2outer_v4_udp = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(struct v4_tuple),
+	.value_size = sizeof(struct v4_ct),
+	.max_entries = 1024,
+};
+
+struct bpf_map_def SEC("maps") outer2inner_v4_udp = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(struct v4_tuple),
+	.value_size = sizeof(struct v4_ct),
+	.max_entries = 1024,
+};
+
+struct bpf_map_def SEC("maps") reserved_port_v4_udp = {
 	.type = BPF_MAP_TYPE_QUEUE,
 	.key_size = 0,
 	.value_size = sizeof(__u16),
@@ -214,9 +247,11 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 	struct udphdr *udphdr;
 	struct tcphdr *tcphdr;
 	int proto;
+	struct v4_ct *ct;
 	struct v4_tuple t, t2;
 	int res = 0;
 	struct bpf_fib_lookup fib_params;
+	__u32 csum;
 	proto = parse_packet(ctx, &ethhdr, &iphdr, &icmphdr, &udphdr, &tcphdr);
 	if (proto == 0 || iphdr == NULL)
 	{
@@ -226,23 +261,116 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 	{
 		return XDP_PASS;
 	}
+	if (iphdr->ttl <= 1)
+	{
+		return XDP_PASS;
+	}
+
+	memset(&t, 0, sizeof(t));
+	t.addr = iphdr->saddr;
 	switch (proto)
 	{
 	case IPPROTO_ICMP:
+		return XDP_PASS;
 		break;
 	case IPPROTO_UDP:
+		t.port = bpf_ntohs(udphdr->source);
+		ct = (struct v4_ct *)bpf_map_lookup_elem(&inner2outer_v4_udp, &t);
+		if (ct == NULL)
+		{
+			__u16 outer_port = 0;
+			int rc = bpf_map_pop_elem(&reserved_port_v4_udp, &outer_port);
+			if (rc < 0)
+			{
+				return XDP_PASS;
+			}
+			memset(&fib_params, 0, sizeof(fib_params));
+			fib_params.family = AF_INET;
+			fib_params.tos = iphdr->tos;
+			fib_params.l4_protocol = iphdr->protocol;
+			fib_params.sport = 0;
+			fib_params.dport = 0;
+			fib_params.tot_len = bpf_ntohs(iphdr->tot_len);
+			fib_params.ipv4_src = iphdr->saddr;
+			fib_params.ipv4_dst = iphdr->daddr;
+			fib_params.ifindex = ctx->ingress_ifindex;
+
+			rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+			if (rc != BPF_FIB_LKUP_RET_SUCCESS || fib_params.ifindex != c->outer_if_index)
+			{
+				return XDP_PASS;
+			}
+
+			struct v4_ct ct_new;
+			memset(&ct_new, 0, sizeof(ct_new));
+			ct_new.inner_addr = iphdr->saddr;
+			ct_new.outer_addr = c->outer_addr;
+			ct_new.end_addr = iphdr->daddr;
+			ct_new.inner_port = bpf_ntohs(udphdr->source);
+			ct_new.outer_port = outer_port;
+			ct_new.end_port = bpf_ntohs(udphdr->dest);
+			ct_new.type = NAT_TYPE_SYMMETRIC;
+			ct_new.pkt_count = 0;
+			ct_new.ktime = bpf_ktime_get_ns();
+			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
+			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
+			memcpy(ct_new.outer_src_mac, fib_params.smac, ETH_ALEN);
+			memcpy(ct_new.outer_dst_mac, fib_params.dmac, ETH_ALEN);
+			res = bpf_map_update_elem(&inner2outer_v4_udp, &t, &ct_new, BPF_ANY);
+			if (res < 0)
+			{
+				return XDP_DROP;
+			}
+
+			memset(&t2, 0, sizeof(t2));
+			t2.addr = ct_new.outer_addr;
+			t2.port = ct_new.outer_port;
+			res = bpf_map_update_elem(&outer2inner_v4_udp, &t2, &ct_new, BPF_ANY);
+			if (res < 0)
+			{
+				return XDP_DROP;
+			}
+			ct = &ct_new;
+		}
+		ct->pkt_count += 1;
+		ct->oct_count += ctx->data_end - ctx->data;
+		ct->ktime = bpf_ktime_get_ns();
+		memcpy(ethhdr->h_source, ct->outer_src_mac, ETH_ALEN);
+		memcpy(ethhdr->h_dest, ct->outer_dst_mac, ETH_ALEN);
+
+		// update UDP header checksum
+		csum = ~udphdr->check;
+		csum = csum16_add(csum, ~udphdr->source);
+		csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
+		csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
+
+		udphdr->source = bpf_htons(ct->outer_port);
+
+		csum = csum16_add(csum, udphdr->source);
+		csum = csum16_add(csum, (__u16)(ct->outer_addr >> 16));
+		csum = csum16_add(csum, (__u16)(ct->outer_addr));
+		udphdr->check = ~csum;
+
+		// update IP header checksum
+		csum = ~iphdr->check;
+		csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
+		csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
+
+		iphdr->saddr = ct->outer_addr;
+
+		csum = csum16_add(csum, (__u16)(iphdr->saddr >> 16));
+		csum = csum16_add(csum, (__u16)(iphdr->saddr));
+		iphdr->check = ~csum;
+
+		// decrease ip ttl
+		ip_decrease_ttl(iphdr);
+
+		return bpf_redirect(c->outer_if_index, 0);
 		break;
 	case IPPROTO_TCP:
-		if (iphdr->ttl <= 1)
-		{
-			return XDP_PASS;
-		}
-
-		memset(&t, 0, sizeof(t));
-		t.addr = iphdr->saddr;
 		t.port = bpf_ntohs(tcphdr->source);
 
-		struct v4_ct *ct = (struct v4_ct *)bpf_map_lookup_elem(&inner2outer_v4_tcp, &t);
+		ct = (struct v4_ct *)bpf_map_lookup_elem(&inner2outer_v4_tcp, &t);
 		if (ct == NULL)
 		{
 			if (tcphdr->syn == 0)
@@ -272,6 +400,15 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 				return XDP_PASS;
 			}
 
+			struct state st;
+			memset(&st, 0, sizeof(st));
+			st.state = NAT_STATE_TCP_RECV_SYN;
+			res = bpf_map_update_elem(&state_v4_tcp, &t, &st, BPF_ANY);
+			if (res < 0)
+			{
+				return XDP_DROP;
+			}
+
 			struct v4_ct ct_new;
 			memset(&ct_new, 0, sizeof(ct_new));
 			ct_new.inner_addr = iphdr->saddr;
@@ -283,7 +420,6 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			ct_new.type = NAT_TYPE_SYMMETRIC;
 			ct_new.pkt_count = 0;
 			ct_new.ktime = bpf_ktime_get_ns();
-			ct_new.state = NAT_STATE_TCP_RECV_SYN;
 			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
 			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
 			memcpy(ct_new.outer_src_mac, fib_params.smac, ETH_ALEN);
@@ -306,44 +442,52 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 		}
 		else
 		{
-			if (ct->state == NAT_STATE_TCP_RESET || ct->state == NAT_STATE_TCP_CLOSED)
+			struct state *st = (struct state *)bpf_map_lookup_elem(&state_v4_tcp, &t);
+			if (st == NULL)
+			{
+				return XDP_DROP;
+			}
+			if (st->state == NAT_STATE_TCP_RESET || st->state == NAT_STATE_TCP_CLOSED)
 			{
 				return XDP_DROP;
 			}
 			if (tcphdr->rst)
 			{
-				ct->state = NAT_STATE_TCP_RESET;
+				st->state = NAT_STATE_TCP_RESET;
 			}
 			if (tcphdr->fin)
 			{
-				if (ct->state == NAT_STATE_TCP_WAIT_INNER_FIN2)
+				if (st->state == NAT_STATE_TCP_WAIT_INNER_FIN2)
 				{
-					ct->state = NAT_STATE_TCP_RECV_INNER_FIN2;
+					st->state = NAT_STATE_TCP_RECV_INNER_FIN2;
 				}
 				else
 				{
-					ct->state = NAT_STATE_TCP_RECV_INNER_FIN;
+					st->state = NAT_STATE_TCP_RECV_INNER_FIN;
 				}
 			}
-			else if (ct->state == NAT_STATE_TCP_RECV_OUTER_FIN && tcphdr->ack)
+			else if (st->state == NAT_STATE_TCP_RECV_OUTER_FIN && tcphdr->ack)
 			{
-				ct->state = NAT_STATE_TCP_WAIT_INNER_FIN2;
+				st->state = NAT_STATE_TCP_WAIT_INNER_FIN2;
 			}
-			else if (ct->state == NAT_STATE_TCP_RECV_OUTER_FIN2 && tcphdr->ack)
+			else if (st->state == NAT_STATE_TCP_RECV_OUTER_FIN2 && tcphdr->ack)
 			{
-				ct->state = NAT_STATE_TCP_CLOSED;
+				st->state = NAT_STATE_TCP_CLOSED;
 			}
-			else if (ct->state == NAT_STATE_TCP_RECV_SYN_ACK && tcphdr->ack)
+			else if (st->state == NAT_STATE_TCP_RECV_SYN_ACK && tcphdr->ack)
 			{
-				ct->state = NAT_STATE_TCP_ESTABLISHED;
+				st->state = NAT_STATE_TCP_ESTABLISHED;
 			}
 		}
+		ct->pkt_count += 1;
+		ct->oct_count += ctx->data_end - ctx->data;
+		ct->ktime = bpf_ktime_get_ns();
 
 		memcpy(ethhdr->h_source, ct->outer_src_mac, ETH_ALEN);
 		memcpy(ethhdr->h_dest, ct->outer_dst_mac, ETH_ALEN);
 
 		// update TCP header checksum
-		__u32 csum = ~tcphdr->check;
+		csum = ~tcphdr->check;
 		csum = csum16_add(csum, ~tcphdr->source);
 		csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
 		csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
@@ -392,70 +536,130 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 	struct udphdr *udphdr;
 	struct tcphdr *tcphdr;
 	int proto;
+	struct v4_ct *ct;
 	struct v4_tuple t;
+	__u32 csum;
 	proto = parse_packet(ctx, &ethhdr, &iphdr, &icmphdr, &udphdr, &tcphdr);
-	if (proto == 0)
+	if (proto == 0 || iphdr == NULL)
 	{
 		return XDP_PASS;
 	}
+	if (iphdr->ttl <= 1)
+	{
+		return XDP_PASS;
+	}
+
+	memset(&t, 0, sizeof(t));
+	t.addr = iphdr->daddr;
+
 	switch (proto)
 	{
 	case IPPROTO_ICMP:
+		return XDP_PASS;
 		break;
 	case IPPROTO_UDP:
-		break;
-	case IPPROTO_TCP:
-		if (iphdr == NULL)
-		{
-			return XDP_DROP;
-		}
-		if (iphdr->ttl <= 1)
+		t.port = bpf_ntohs(udphdr->dest);
+		ct = (struct v4_ct *)bpf_map_lookup_elem(&outer2inner_v4_udp, &t);
+		if (ct == NULL)
 		{
 			return XDP_PASS;
 		}
-		memset(&t, 0, sizeof(t));
-		t.addr = iphdr->daddr;
+		if (ct->type == NAT_TYPE_SYMMETRIC)
+		{
+			if (ct->end_addr != iphdr->saddr || ct->end_port != bpf_ntohs(udphdr->source))
+			{
+				return XDP_DROP;
+			}
+		}
+		else
+		{
+			return XDP_DROP;
+		}
+
+		ct->ktime = bpf_ktime_get_ns();
+		memcpy(ethhdr->h_source, ct->inner_src_mac, ETH_ALEN);
+		memcpy(ethhdr->h_dest, ct->inner_dst_mac, ETH_ALEN);
+
+		// update UDP header checksum
+		csum = ~udphdr->check;
+		csum = csum16_add(csum, ~udphdr->dest);
+		csum = csum16_add(csum, ~(__u16)(iphdr->daddr >> 16));
+		csum = csum16_add(csum, ~(__u16)(iphdr->daddr));
+
+		udphdr->dest = bpf_htons(ct->inner_port);
+
+		csum = csum16_add(csum, udphdr->dest);
+		csum = csum16_add(csum, (__u16)(ct->inner_addr >> 16));
+		csum = csum16_add(csum, (__u16)(ct->inner_addr));
+		udphdr->check = ~csum;
+
+		// update IP header checksum
+		csum = ~iphdr->check;
+		csum = csum16_add(csum, ~(__u16)(iphdr->daddr >> 16));
+		csum = csum16_add(csum, ~(__u16)(iphdr->daddr));
+
+		iphdr->daddr = ct->inner_addr;
+
+		csum = csum16_add(csum, (__u16)(iphdr->daddr >> 16));
+		csum = csum16_add(csum, (__u16)(iphdr->daddr));
+		iphdr->check = ~csum;
+
+		// decrease ip ttl
+		ip_decrease_ttl(iphdr);
+
+		return bpf_redirect(c->inner_if_index, 0);
+		break;
+	case IPPROTO_TCP:
 		t.port = bpf_ntohs(tcphdr->dest);
-		struct v4_ct *ct = (struct v4_ct *)bpf_map_lookup_elem(&outer2inner_v4_tcp, &t);
+		ct = (struct v4_ct *)bpf_map_lookup_elem(&outer2inner_v4_tcp, &t);
 		if (ct == NULL)
 		{
 			return XDP_PASS;
 		}
 		else
 		{
-			if (ct->state == NAT_STATE_TCP_RESET || ct->state == NAT_STATE_TCP_CLOSED)
+			struct v4_tuple t2;
+			memset(&t2, 0, sizeof(t2));
+			t2.addr = ct->inner_addr;
+			t2.port = ct->inner_port;
+			struct state *st = (struct state *)bpf_map_lookup_elem(&state_v4_tcp, &t2);
+			if (st == NULL)
+			{
+				return XDP_DROP;
+			}
+			if (st->state == NAT_STATE_TCP_RESET || st->state == NAT_STATE_TCP_CLOSED)
 			{
 				return XDP_DROP;
 			}
 
 			if (tcphdr->rst)
 			{
-				ct->state = NAT_STATE_TCP_RESET;
+				st->state = NAT_STATE_TCP_RESET;
 			}
 			if (tcphdr->fin)
 			{
-				if (ct->state == NAT_STATE_TCP_WAIT_OUTER_FIN2)
+				if (st->state == NAT_STATE_TCP_WAIT_OUTER_FIN2)
 				{
-					ct->state = NAT_STATE_TCP_RECV_OUTER_FIN2;
+					st->state = NAT_STATE_TCP_RECV_OUTER_FIN2;
 				}
 				else
 				{
-					ct->state = NAT_STATE_TCP_RECV_OUTER_FIN;
+					st->state = NAT_STATE_TCP_RECV_OUTER_FIN;
 				}
 			}
-			else if (ct->state == NAT_STATE_TCP_RECV_INNER_FIN && tcphdr->ack)
+			else if (st->state == NAT_STATE_TCP_RECV_INNER_FIN && tcphdr->ack)
 			{
-				ct->state = NAT_STATE_TCP_WAIT_OUTER_FIN2;
+				st->state = NAT_STATE_TCP_WAIT_OUTER_FIN2;
 			}
-			else if (ct->state == NAT_STATE_TCP_RECV_INNER_FIN2 && tcphdr->ack)
+			else if (st->state == NAT_STATE_TCP_RECV_INNER_FIN2 && tcphdr->ack)
 			{
-				ct->state = NAT_STATE_TCP_CLOSED;
+				st->state = NAT_STATE_TCP_CLOSED;
 			}
-			else if (ct->state == NAT_STATE_TCP_RECV_SYN)
+			else if (st->state == NAT_STATE_TCP_RECV_SYN)
 			{
 				if (tcphdr->syn && tcphdr->ack)
 				{
-					ct->state = NAT_STATE_TCP_RECV_SYN_ACK;
+					st->state = NAT_STATE_TCP_RECV_SYN_ACK;
 				}
 				else
 				{
@@ -476,11 +680,12 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 			return XDP_DROP;
 		}
 
+		ct->ktime = bpf_ktime_get_ns();
 		memcpy(ethhdr->h_source, ct->inner_src_mac, ETH_ALEN);
 		memcpy(ethhdr->h_dest, ct->inner_dst_mac, ETH_ALEN);
 
 		// update TCP header checksum
-		__u32 csum = ~tcphdr->check;
+		csum = ~tcphdr->check;
 		csum = csum16_add(csum, ~tcphdr->dest);
 		csum = csum16_add(csum, ~(__u16)(iphdr->daddr >> 16));
 		csum = csum16_add(csum, ~(__u16)(iphdr->daddr));
