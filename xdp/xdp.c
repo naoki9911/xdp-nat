@@ -7,12 +7,6 @@
 // The parsing helper functions from the packet01 lesson have moved here
 #include "parsing_helpers.h"
 
-/* Defines xdp_stats_map */
-#include "xdp_stats_kern_user.h"
-#include "xdp_stats_kern.h"
-
-#include "rewrite_helpers.h"
-
 #ifndef memcpy
 #define memcpy(dest, src, n) __builtin_memcpy((dest), (src), (n))
 #endif
@@ -155,29 +149,6 @@ struct bpf_map_def SEC("maps") outer2inner_v4_icmp = {
 	.max_entries = 1024,
 };
 
-// static __always_inline __u16 csum_fold_helper(__u32 csum)
-//{
-//	return ~((csum & 0xffff) + (csum >> 16));
-// }
-//
-///*
-// * The icmp_checksum_diff function takes pointers to old and new structures and
-// * the old checksum and returns the new checksum.  It uses the bpf_csum_diff
-// * helper to compute the checksum difference. Note that the sizes passed to the
-// * bpf_csum_diff helper should be multiples of 4, as it operates on 32-bit
-// * words.
-// */
-// static __always_inline __u16 icmp_checksum_diff(
-//	__u16 seed,
-//	struct icmphdr_common *icmphdr_new,
-//	struct icmphdr_common *icmphdr_old)
-//{
-//	__u32 csum, size = sizeof(struct icmphdr_common);
-//
-//	csum = bpf_csum_diff((__be32 *)icmphdr_old, size, (__be32 *)icmphdr_new, size, seed);
-//	return csum_fold_helper(csum);
-//}
-
 static __always_inline __u16 csum16_add(__u16 csum, __u16 addend)
 {
 	csum += addend;
@@ -191,58 +162,6 @@ static __always_inline int ip_decrease_ttl(struct iphdr *iph)
 	check += bpf_htons(0x0100);
 	iph->check = (__u16)(check + (check >= 0xFFFF));
 	return --iph->ttl;
-}
-
-static __always_inline int parse_packet(
-	struct xdp_md *ctx,
-	struct ethhdr **ethhdr,
-	struct iphdr **iphdr,
-	struct icmphdr **icmphdr,
-	struct udphdr **udphdr,
-	struct tcphdr **tcphdr)
-{
-	void *data_end = (void *)(long)ctx->data_end;
-	void *data = (void *)(long)ctx->data;
-	struct hdr_cursor nh;
-	int nh_type;
-
-	nh.pos = data;
-	nh_type = parse_ethhdr(&nh, data_end, ethhdr);
-
-	if (nh_type != bpf_htons(ETH_P_IP))
-	{
-		return 0;
-	}
-
-	nh_type = parse_iphdr(&nh, data_end, iphdr);
-
-	int res = -1;
-	switch (nh_type)
-	{
-	case IPPROTO_ICMP:
-		res = parse_icmphdr(&nh, data_end, icmphdr);
-		if (res < 0)
-		{
-			return -1;
-		}
-		return nh_type;
-	case IPPROTO_UDP:
-		res = parse_udphdr(&nh, data_end, udphdr);
-		if (res < 0)
-		{
-			return -1;
-		}
-		return nh_type;
-	case IPPROTO_TCP:
-		res = parse_tcphdr(&nh, data_end, tcphdr);
-		if (res < 0)
-		{
-			return -1;
-		}
-		return nh_type;
-	default:
-		return -1;
-	}
 }
 
 SEC("xdp_nat_inner2outer")

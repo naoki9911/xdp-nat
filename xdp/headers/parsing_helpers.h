@@ -269,4 +269,56 @@ static __always_inline int parse_tcphdr(struct hdr_cursor *nh,
 	return len;
 }
 
+static __always_inline int parse_packet(
+	struct xdp_md *ctx,
+	struct ethhdr **ethhdr,
+	struct iphdr **iphdr,
+	struct icmphdr **icmphdr,
+	struct udphdr **udphdr,
+	struct tcphdr **tcphdr)
+{
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+	struct hdr_cursor nh;
+	int nh_type;
+
+	nh.pos = data;
+	nh_type = parse_ethhdr(&nh, data_end, ethhdr);
+
+	if (nh_type != bpf_htons(ETH_P_IP))
+	{
+		return 0;
+	}
+
+	nh_type = parse_iphdr(&nh, data_end, iphdr);
+
+	int res = -1;
+	switch (nh_type)
+	{
+	case IPPROTO_ICMP:
+		res = parse_icmphdr(&nh, data_end, icmphdr);
+		if (res < 0)
+		{
+			return -1;
+		}
+		return nh_type;
+	case IPPROTO_UDP:
+		res = parse_udphdr(&nh, data_end, udphdr);
+		if (res < 0)
+		{
+			return -1;
+		}
+		return nh_type;
+	case IPPROTO_TCP:
+		res = parse_tcphdr(&nh, data_end, tcphdr);
+		if (res < 0)
+		{
+			return -1;
+		}
+		return nh_type;
+	default:
+		return -1;
+	}
+}
+
 #endif /* __PARSING_HELPERS_H */

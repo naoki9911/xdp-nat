@@ -72,7 +72,6 @@ type bpfMapSpecs struct {
 	ReservedPortV4Tcp *ebpf.MapSpec `ebpf:"reserved_port_v4_tcp"`
 	ReservedPortV4Udp *ebpf.MapSpec `ebpf:"reserved_port_v4_udp"`
 	StateV4Tcp        *ebpf.MapSpec `ebpf:"state_v4_tcp"`
-	XdpStatsMap       *ebpf.MapSpec `ebpf:"xdp_stats_map"`
 }
 
 // bpfObjects contains all objects after they have been loaded into the kernel.
@@ -104,7 +103,6 @@ type bpfMaps struct {
 	ReservedPortV4Tcp *ebpf.Map `ebpf:"reserved_port_v4_tcp"`
 	ReservedPortV4Udp *ebpf.Map `ebpf:"reserved_port_v4_udp"`
 	StateV4Tcp        *ebpf.Map `ebpf:"state_v4_tcp"`
-	XdpStatsMap       *ebpf.Map `ebpf:"xdp_stats_map"`
 }
 
 func (m *bpfMaps) Close() error {
@@ -119,7 +117,6 @@ func (m *bpfMaps) Close() error {
 		m.ReservedPortV4Tcp,
 		m.ReservedPortV4Udp,
 		m.StateV4Tcp,
-		m.XdpStatsMap,
 	)
 }
 
