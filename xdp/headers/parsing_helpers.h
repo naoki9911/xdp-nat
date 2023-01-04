@@ -1,3 +1,5 @@
+// Some parts of this code is borrowed from https://github.com/xdp-project/xdp-tutorial/blob/master/common/parsing_helpers.h
+
 /* SPDX-License-Identifier: (GPL-2.0-or-later OR BSD-2-clause) */
 /*
  * This file contains parsing functions that are used in the packetXX XDP

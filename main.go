@@ -138,6 +138,19 @@ type Metric struct {
 	Outer2InnerOctetCount   uint64
 }
 
+func NewMetricFromV4CT(v V4CT) Metric {
+	return Metric{
+		InnerAddr:              v.InnerAddr,
+		InnerPort:              v.InnerPort,
+		OuterAddr:              v.OuterAddr,
+		OuterPort:              v.OuterPort,
+		EndpointAddr:           v.EndAddr,
+		EndpointPort:           v.EndPort,
+		Inner2OuterPacketCount: v.PktCount,
+		Inner2OuterOctetCount:  v.OctCount,
+	}
+}
+
 func (m Metric) ToStrings() []string {
 	res := make([]string, 0)
 	res = append(res, m.Protocol)
@@ -251,19 +264,11 @@ func main() {
 				continue
 			}
 			m_k := fmt.Sprintf("%s:%d=%s:%d:TCP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
-			metrics[m_k] = Metric{
-				Protocol:                "TCP",
-				InnerAddr:               v.InnerAddr,
-				InnerPort:               v.InnerPort,
-				OuterAddr:               v.OuterAddr,
-				OuterPort:               v.OuterPort,
-				EndpointAddr:            v.EndAddr,
-				EndpointPort:            v.EndPort,
-				Misc:                    fmt.Sprintf("State=%d", state),
-				Inner2OuterPacketCount:  v.PktCount,
-				Inner2OuterOctetCount:   v.OctCount,
-				LastPacketElapsedSecond: int(elapsed_sec),
-			}
+			m := NewMetricFromV4CT(v)
+			m.Misc = fmt.Sprintf("State=%d", state)
+			m.LastPacketElapsedSecond = int(elapsed_sec)
+			m.Protocol = "TCP"
+			metrics[m_k] = m
 		}
 
 		t, err = readNatTable(objs.Outer2innerV4Tcp)
@@ -298,18 +303,10 @@ func main() {
 			elapsed_nano := unix_nano - v.KTime
 			elapsed_sec := int(elapsed_nano / (1000 * 1000 * 1000))
 			m_k := fmt.Sprintf("%s:%d=%s:%d:UDP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
-			metrics[m_k] = Metric{
-				Protocol:                "UDP",
-				InnerAddr:               v.InnerAddr,
-				InnerPort:               v.InnerPort,
-				OuterAddr:               v.OuterAddr,
-				OuterPort:               v.OuterPort,
-				EndpointAddr:            v.EndAddr,
-				EndpointPort:            v.EndPort,
-				Inner2OuterPacketCount:  v.PktCount,
-				Inner2OuterOctetCount:   v.OctCount,
-				LastPacketElapsedSecond: int(elapsed_sec),
-			}
+			m := NewMetricFromV4CT(v)
+			m.Protocol = "UDP"
+			m.LastPacketElapsedSecond = int(elapsed_sec)
+			metrics[m_k] = m
 		}
 
 		t, err = readNatTable(objs.Outer2innerV4Udp)
@@ -344,19 +341,11 @@ func main() {
 			elapsed_nano := unix_nano - v.KTime
 			elapsed_sec := int(elapsed_nano / (1000 * 1000 * 1000))
 			m_k := fmt.Sprintf("%s:%d=%s:%d:ICMP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
-			metrics[m_k] = Metric{
-				Protocol:                "ICMP",
-				InnerAddr:               v.InnerAddr,
-				InnerPort:               v.InnerPort,
-				OuterAddr:               v.OuterAddr,
-				OuterPort:               v.OuterPort,
-				EndpointAddr:            v.EndAddr,
-				EndpointPort:            v.EndPort,
-				Misc:                    fmt.Sprintf("ID=0x%04X", v.InnerPort),
-				Inner2OuterPacketCount:  v.PktCount,
-				Inner2OuterOctetCount:   v.OctCount,
-				LastPacketElapsedSecond: int(elapsed_sec),
-			}
+			m := NewMetricFromV4CT(v)
+			m.Protocol = "ICMP"
+			m.Misc = fmt.Sprintf("ID=0x%04X", v.InnerPort)
+			m.LastPacketElapsedSecond = int(elapsed_sec)
+			metrics[m_k] = m
 		}
 
 		t, err = readNatTable(objs.Outer2innerV4Icmp)

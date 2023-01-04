@@ -4,7 +4,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// The parsing helper functions from the packet01 lesson have moved here
 #include "parsing_helpers.h"
 
 #ifndef memcpy
@@ -164,6 +163,46 @@ static __always_inline int ip_decrease_ttl(struct iphdr *iph)
 	return --iph->ttl;
 }
 
+static __always_inline int lookup_fib_and_create_new_ct_v4(
+	struct config *c,
+	struct xdp_md *ctx,
+	struct ethhdr *ethhdr,
+	struct iphdr *iphdr,
+	struct v4_ct *ct)
+{
+	struct bpf_fib_lookup fib_params;
+	memset(&fib_params, 0, sizeof(fib_params));
+	fib_params.family = AF_INET;
+	fib_params.tos = iphdr->tos;
+	fib_params.l4_protocol = iphdr->protocol;
+	fib_params.sport = 0;
+	fib_params.dport = 0;
+	fib_params.tot_len = bpf_ntohs(iphdr->tot_len);
+	fib_params.ipv4_src = iphdr->saddr;
+	fib_params.ipv4_dst = iphdr->daddr;
+	fib_params.ifindex = ctx->ingress_ifindex;
+
+	int rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+	if (rc != BPF_FIB_LKUP_RET_SUCCESS || fib_params.ifindex != c->outer_if_index)
+	{
+		return XDP_PASS;
+	}
+
+	ct->inner_addr = iphdr->saddr;
+	ct->outer_addr = c->outer_addr;
+	ct->end_addr = iphdr->daddr;
+
+	ct->pkt_count = 1;
+	ct->oct_count = ctx->data_end - ctx->data;
+	ct->ktime = bpf_ktime_get_ns();
+	memcpy(ct->inner_src_mac, ethhdr->h_dest, ETH_ALEN);
+	memcpy(ct->inner_dst_mac, ethhdr->h_source, ETH_ALEN);
+	memcpy(ct->outer_src_mac, fib_params.smac, ETH_ALEN);
+	memcpy(ct->outer_dst_mac, fib_params.dmac, ETH_ALEN);
+
+	return XDP_REDIRECT;
+}
+
 SEC("xdp_nat_inner2outer")
 int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 {
@@ -183,7 +222,6 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 	struct v4_ct *ct;
 	struct v4_tuple t, t2;
 	int res = 0;
-	struct bpf_fib_lookup fib_params;
 	__u32 csum;
 	proto = parse_packet(ctx, &ethhdr, &iphdr, &icmphdr, &udphdr, &tcphdr);
 	if (proto == 0 || iphdr == NULL)
@@ -212,36 +250,17 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 		ct = (struct v4_ct *)bpf_map_lookup_elem(&inner2outer_v4_icmp, &t);
 		if (ct == NULL)
 		{
-			memset(&fib_params, 0, sizeof(fib_params));
-			fib_params.family = AF_INET;
-			fib_params.tos = iphdr->tos;
-			fib_params.l4_protocol = iphdr->protocol;
-			fib_params.tot_len = bpf_ntohs(iphdr->tot_len);
-			fib_params.ipv4_src = iphdr->saddr;
-			fib_params.ipv4_dst = iphdr->daddr;
-			fib_params.ifindex = ctx->ingress_ifindex;
-
-			int rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
-			if (rc != BPF_FIB_LKUP_RET_SUCCESS || fib_params.ifindex != c->outer_if_index)
-			{
-				return XDP_PASS;
-			}
-
 			struct v4_ct ct_new;
 			memset(&ct_new, 0, sizeof(ct_new));
-			ct_new.inner_addr = iphdr->saddr;
-			ct_new.outer_addr = c->outer_addr;
+			int action = lookup_fib_and_create_new_ct_v4(c, ctx, ethhdr, iphdr, &ct_new);
+			if (action != XDP_REDIRECT)
+			{
+				return action;
+			}
 			ct_new.end_addr = iphdr->daddr;
 			ct_new.inner_port = t.port;
 			ct_new.outer_port = t.port;
 			ct_new.type = NAT_TYPE_SYMMETRIC;
-			ct_new.pkt_count = 1;
-			ct_new.oct_count = ctx->data_end - ctx->data;
-			ct_new.ktime = bpf_ktime_get_ns();
-			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
-			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
-			memcpy(ct_new.outer_src_mac, fib_params.smac, ETH_ALEN);
-			memcpy(ct_new.outer_dst_mac, fib_params.dmac, ETH_ALEN);
 			res = bpf_map_update_elem(&inner2outer_v4_icmp, &t, &ct_new, BPF_ANY);
 			if (res < 0)
 			{
@@ -276,39 +295,18 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			{
 				return XDP_PASS;
 			}
-			memset(&fib_params, 0, sizeof(fib_params));
-			fib_params.family = AF_INET;
-			fib_params.tos = iphdr->tos;
-			fib_params.l4_protocol = iphdr->protocol;
-			fib_params.sport = 0;
-			fib_params.dport = 0;
-			fib_params.tot_len = bpf_ntohs(iphdr->tot_len);
-			fib_params.ipv4_src = iphdr->saddr;
-			fib_params.ipv4_dst = iphdr->daddr;
-			fib_params.ifindex = ctx->ingress_ifindex;
-
-			rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
-			if (rc != BPF_FIB_LKUP_RET_SUCCESS || fib_params.ifindex != c->outer_if_index)
-			{
-				return XDP_PASS;
-			}
-
 			struct v4_ct ct_new;
 			memset(&ct_new, 0, sizeof(ct_new));
-			ct_new.inner_addr = iphdr->saddr;
-			ct_new.outer_addr = c->outer_addr;
-			ct_new.end_addr = iphdr->daddr;
+			int action = lookup_fib_and_create_new_ct_v4(c, ctx, ethhdr, iphdr, &ct_new);
+			if (action != XDP_REDIRECT)
+			{
+				return action;
+			}
+
 			ct_new.inner_port = bpf_ntohs(udphdr->source);
 			ct_new.outer_port = outer_port;
 			ct_new.end_port = bpf_ntohs(udphdr->dest);
 			ct_new.type = NAT_TYPE_SYMMETRIC;
-			ct_new.pkt_count = 1;
-			ct_new.oct_count = ctx->data_end - ctx->data;
-			ct_new.ktime = bpf_ktime_get_ns();
-			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
-			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
-			memcpy(ct_new.outer_src_mac, fib_params.smac, ETH_ALEN);
-			memcpy(ct_new.outer_dst_mac, fib_params.dmac, ETH_ALEN);
 			res = bpf_map_update_elem(&inner2outer_v4_udp, &t, &ct_new, BPF_ANY);
 			if (res < 0)
 			{
@@ -361,23 +359,6 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			{
 				return XDP_PASS;
 			}
-			memset(&fib_params, 0, sizeof(fib_params));
-			fib_params.family = AF_INET;
-			fib_params.tos = iphdr->tos;
-			fib_params.l4_protocol = iphdr->protocol;
-			fib_params.sport = 0;
-			fib_params.dport = 0;
-			fib_params.tot_len = bpf_ntohs(iphdr->tot_len);
-			fib_params.ipv4_src = iphdr->saddr;
-			fib_params.ipv4_dst = iphdr->daddr;
-			fib_params.ifindex = ctx->ingress_ifindex;
-
-			rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
-			if (rc != BPF_FIB_LKUP_RET_SUCCESS || fib_params.ifindex != c->outer_if_index)
-			{
-				return XDP_PASS;
-			}
-
 			struct state st;
 			memset(&st, 0, sizeof(st));
 			st.state = NAT_STATE_TCP_RECV_SYN;
@@ -389,20 +370,16 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 
 			struct v4_ct ct_new;
 			memset(&ct_new, 0, sizeof(ct_new));
-			ct_new.inner_addr = iphdr->saddr;
-			ct_new.outer_addr = c->outer_addr;
-			ct_new.end_addr = iphdr->daddr;
+			int action = lookup_fib_and_create_new_ct_v4(c, ctx, ethhdr, iphdr, &ct_new);
+			if (action != XDP_REDIRECT)
+			{
+				return action;
+			}
+
 			ct_new.inner_port = bpf_ntohs(tcphdr->source);
 			ct_new.outer_port = outer_port;
 			ct_new.end_port = bpf_ntohs(tcphdr->dest);
 			ct_new.type = NAT_TYPE_SYMMETRIC;
-			ct_new.pkt_count = 1;
-			ct_new.oct_count = ctx->data_end - ctx->data;
-			ct_new.ktime = bpf_ktime_get_ns();
-			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
-			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
-			memcpy(ct_new.outer_src_mac, fib_params.smac, ETH_ALEN);
-			memcpy(ct_new.outer_dst_mac, fib_params.dmac, ETH_ALEN);
 			res = bpf_map_update_elem(&inner2outer_v4_tcp, &t, &ct_new, BPF_ANY);
 			if (res < 0)
 			{
