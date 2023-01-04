@@ -271,7 +271,7 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 	{
 		return XDP_PASS;
 	}
-	if (iphdr->daddr == c->inner_addr)
+	if (iphdr->daddr == c->inner_addr || iphdr->daddr == c->outer_addr)
 	{
 		return XDP_PASS;
 	}

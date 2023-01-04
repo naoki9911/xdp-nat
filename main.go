@@ -3,14 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/olekukonko/tablewriter"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc $BPF_CLANG -cflags $BPF_CFLAGS bpf xdp/xdp.c -- -I./xdp/headers
@@ -119,6 +122,36 @@ type ConfigC struct {
 	OuterAddr    uint32
 }
 
+type Metric struct {
+	Protocol                string
+	InnerAddr               net.IP
+	InnerPort               uint16
+	OuterAddr               net.IP
+	OuterPort               uint16
+	EndpointAddr            net.IP
+	EndpointPort            uint16
+	LastPacketElapsedSecond int
+	Inner2OuterPacketCount  uint64
+	Inner2OuterOctetCount   uint64
+	Outer2InnerPacketCount  uint64
+	Outer2InnerOctetCount   uint64
+}
+
+func (m Metric) ToStrings() []string {
+	res := make([]string, 0)
+	res = append(res, m.Protocol)
+	res = append(res, fmt.Sprintf("%s:%d", m.InnerAddr, m.InnerPort))
+	res = append(res, fmt.Sprintf("%s:%d", m.OuterAddr, m.OuterPort))
+	res = append(res, fmt.Sprintf("%s:%d", m.EndpointAddr, m.EndpointPort))
+	res = append(res, fmt.Sprintf("%d", m.LastPacketElapsedSecond))
+	res = append(res, fmt.Sprintf("%d", m.Inner2OuterPacketCount))
+	res = append(res, fmt.Sprintf("%d", m.Outer2InnerPacketCount))
+	res = append(res, fmt.Sprintf("%d", m.Inner2OuterOctetCount))
+	res = append(res, fmt.Sprintf("%d", m.Outer2InnerOctetCount))
+
+	return res
+}
+
 const pinBaseDir = "/sys/fs/bpf"
 
 var pinGlobalDir = filepath.Join(pinBaseDir, "global")
@@ -197,17 +230,15 @@ func main() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
+		metrics := map[string]Metric{}
 		unix_nano := int64(C.get_nsecs())
-		expiredKeyI2O := make([]V4TupleC, 0)
-		expiredKeyO2I := make([]V4TupleC, 0)
+
 		t, err := readNatTable(objs.Inner2outerV4Tcp)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
 			continue
 		}
-		log.Println("Inner2outer_v4TCP:")
 		for kc, vc := range t {
-			k := kc.ToGo()
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
 			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
@@ -217,17 +248,18 @@ func main() {
 				log.Printf("Error to get state: %s", err)
 				continue
 			}
-			log.Printf(" InnerAddr=%s:%d =>", k.Addr, k.Port)
-			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d endAddr=%s:%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.EndAddr, v.EndPort)
-			log.Printf("   innerSrcMAC=%s innerDstMAC=%s outerSrcMAC=%s outerDstMAC=%s\n", v.InnerSrcMAC, v.InnerDstMAC, v.OuterSrcMAC, v.OuterDstMAC)
-			log.Printf("   pktCount=%d octCount=%d elapsed=%d state=%d\n", v.PktCount, v.OctCount, elapsed_sec, state)
-			if elapsed_sec > 10 {
-				expiredKeyI2O = append(expiredKeyI2O, kc)
-				k2 := V4TupleC{
-					Addr: vc.OuterAddr,
-					Port: vc.OuterPort,
-				}
-				expiredKeyO2I = append(expiredKeyO2I, k2)
+			m_k := fmt.Sprintf("%s:%d=%s:%d:TCP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
+			metrics[m_k] = Metric{
+				Protocol:                "TCP",
+				InnerAddr:               v.InnerAddr,
+				InnerPort:               v.InnerPort,
+				OuterAddr:               v.OuterAddr,
+				OuterPort:               v.OuterPort,
+				EndpointAddr:            v.EndAddr,
+				EndpointPort:            v.EndPort,
+				Inner2OuterPacketCount:  v.PktCount,
+				Inner2OuterOctetCount:   v.OctCount,
+				LastPacketElapsedSecond: int(elapsed_sec),
 			}
 		}
 
@@ -236,64 +268,44 @@ func main() {
 			log.Printf("Error reading map: %s", err)
 			continue
 		}
-		log.Println("Outer2inner_v4TCP:")
-		for kc, vc := range t {
-			k := kc.ToGo()
+		for _, vc := range t {
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
-			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
-			log.Printf(" OuterAddr=%s:%d =>", k.Addr, k.Port)
-			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
-			log.Printf("   pktCount=%d octCount=%d\n", v.PktCount, v.OctCount, elapsed_sec)
+			elapsed_sec := int(elapsed_nano / (1000 * 1000 * 1000))
+			m_k := fmt.Sprintf("%s:%d=%s:%d:TCP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
+			m, ok := metrics[m_k]
+			if !ok {
+				log.Printf("failed to get metric %s", m_k)
+			}
+			if m.LastPacketElapsedSecond > elapsed_sec {
+				m.LastPacketElapsedSecond = elapsed_sec
+			}
+			m.Outer2InnerPacketCount = v.PktCount
+			m.Outer2InnerOctetCount = v.OctCount
+			metrics[m_k] = m
 		}
 
-		for _, kc := range expiredKeyI2O {
-			err = objs.Inner2outerV4Tcp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
-			}
-
-			err = objs.StateV4Tcp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from state_v4_tcp err=%s", kc, err)
-			}
-		}
-		for _, kc := range expiredKeyO2I {
-			err = objs.Outer2innerV4Tcp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
-			}
-
-			err = objs.ReservedPortV4Tcp.Put(nil, kc.Port)
-			if err != nil {
-				log.Fatalf("could not put reserved port: %s", err)
-			}
-		}
-
-		expiredKeyI2O = make([]V4TupleC, 0)
-		expiredKeyO2I = make([]V4TupleC, 0)
 		t, err = readNatTable(objs.Inner2outerV4Udp)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
 			continue
 		}
-		log.Println("Inner2outer_v4UDP:")
-		for kc, vc := range t {
-			k := kc.ToGo()
+		for _, vc := range t {
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
-			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
-			log.Printf(" InnerAddr=%s:%d =>", k.Addr, k.Port)
-			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d endAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.EndAddr, v.EndPort, v.PktCount, elapsed_sec)
-			log.Printf("   innerSrcMAC=%s innerDstMAC=%s outerSrcMAC=%s outerDstMAC=%s\n", v.InnerSrcMAC, v.InnerDstMAC, v.OuterSrcMAC, v.OuterDstMAC)
-			log.Printf("   pktCount=%d octCount=%d elapsed=%d\n", v.PktCount, v.OctCount, elapsed_sec)
-			if elapsed_sec > 10 {
-				expiredKeyI2O = append(expiredKeyI2O, kc)
-				k2 := V4TupleC{
-					Addr: vc.OuterAddr,
-					Port: vc.OuterPort,
-				}
-				expiredKeyO2I = append(expiredKeyO2I, k2)
+			elapsed_sec := int(elapsed_nano / (1000 * 1000 * 1000))
+			m_k := fmt.Sprintf("%s:%d=%s:%d:UDP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
+			metrics[m_k] = Metric{
+				Protocol:                "UDP",
+				InnerAddr:               v.InnerAddr,
+				InnerPort:               v.InnerPort,
+				OuterAddr:               v.OuterAddr,
+				OuterPort:               v.OuterPort,
+				EndpointAddr:            v.EndAddr,
+				EndpointPort:            v.EndPort,
+				Inner2OuterPacketCount:  v.PktCount,
+				Inner2OuterOctetCount:   v.OctCount,
+				LastPacketElapsedSecond: int(elapsed_sec),
 			}
 		}
 
@@ -302,59 +314,44 @@ func main() {
 			log.Printf("Error reading map: %s", err)
 			continue
 		}
-		log.Println("Outer2inner_v4UDP:")
-		for kc, vc := range t {
-			k := kc.ToGo()
+		for _, vc := range t {
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
-			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
-			log.Printf(" OuterAddr=%s:%d =>", k.Addr, k.Port)
-			log.Printf("   innerAddr=%s:%d outerAddr=%s:%d pktCount=%x elapsed=%d\n", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
-			log.Printf("   pktCount=%d octCount=%d elapsed=%d\n", v.PktCount, v.OctCount, elapsed_sec)
+			elapsed_sec := int(elapsed_nano / (1000 * 1000 * 1000))
+			m_k := fmt.Sprintf("%s:%d=%s:%d:UDP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
+			m, ok := metrics[m_k]
+			if !ok {
+				log.Printf("failed to get metric %s", m_k)
+			}
+			if m.LastPacketElapsedSecond > elapsed_sec {
+				m.LastPacketElapsedSecond = elapsed_sec
+			}
+			m.Outer2InnerPacketCount = v.PktCount
+			m.Outer2InnerOctetCount = v.OctCount
+			metrics[m_k] = m
 		}
 
-		for _, kc := range expiredKeyI2O {
-			err = objs.Inner2outerV4Udp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
-			}
-		}
-		for _, kc := range expiredKeyO2I {
-			err = objs.Outer2innerV4Udp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
-			}
-
-			err = objs.ReservedPortV4Udp.Put(nil, kc.Port)
-			if err != nil {
-				log.Fatalf("could not put reserved port: %s", err)
-			}
-		}
-
-		expiredKeyI2O = make([]V4TupleC, 0)
-		expiredKeyO2I = make([]V4TupleC, 0)
 		t, err = readNatTable(objs.Inner2outerV4Icmp)
 		if err != nil {
 			log.Printf("Error reading map: %s", err)
 			continue
 		}
-		log.Println("Inner2outer_v4ICMP:")
-		for kc, vc := range t {
-			k := kc.ToGo()
+		for _, vc := range t {
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
-			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
-			log.Printf(" InnerAddr=%s =>", k.Addr)
-			log.Printf("   innerAddr=%s outerAddr=%s endAddr=%s id=0x%04x pktCount=%x elapsed=%d\n", v.InnerAddr, v.OuterAddr, v.EndAddr, v.InnerPort, v.PktCount, elapsed_sec)
-			log.Printf("   innerSrcMAC=%s innerDstMAC=%s outerSrcMAC=%s outerDstMAC=%s\n", v.InnerSrcMAC, v.InnerDstMAC, v.OuterSrcMAC, v.OuterDstMAC)
-			log.Printf("   pktCount=%d octCount=%d elapsed=%d\n", v.PktCount, v.OctCount, elapsed_sec)
-			if elapsed_sec > 10 {
-				expiredKeyI2O = append(expiredKeyI2O, kc)
-				k2 := V4TupleC{
-					Addr: vc.OuterAddr,
-					Port: vc.OuterPort,
-				}
-				expiredKeyO2I = append(expiredKeyO2I, k2)
+			elapsed_sec := int(elapsed_nano / (1000 * 1000 * 1000))
+			m_k := fmt.Sprintf("%s:%d=%s:%d:ICMP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
+			metrics[m_k] = Metric{
+				Protocol:                "ICMP",
+				InnerAddr:               v.InnerAddr,
+				InnerPort:               v.InnerPort,
+				OuterAddr:               v.OuterAddr,
+				OuterPort:               v.OuterPort,
+				EndpointAddr:            v.EndAddr,
+				EndpointPort:            v.EndPort,
+				Inner2OuterPacketCount:  v.PktCount,
+				Inner2OuterOctetCount:   v.OctCount,
+				LastPacketElapsedSecond: int(elapsed_sec),
 			}
 		}
 
@@ -363,27 +360,76 @@ func main() {
 			log.Printf("Error reading map: %s", err)
 			continue
 		}
-		log.Println("Outer2inner_v4ICMP:")
-		for kc, vc := range t {
-			k := kc.ToGo()
+		for _, vc := range t {
 			v := vc.ToGo()
 			elapsed_nano := unix_nano - v.KTime
-			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
-			log.Printf(" OuterAddr=%s =>", k.Addr)
-			log.Printf("   innerAddr=%s outerAddr=%s id=0x%04X pktCount=%x elapsed=%d\n", v.InnerAddr, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
-			log.Printf("   pktCount=%d octCount=%d elapsed=%d\n", v.PktCount, v.OctCount, elapsed_sec)
+			elapsed_sec := int(elapsed_nano / (1000 * 1000 * 1000))
+			m_k := fmt.Sprintf("%s:%d=%s:%d:ICMP", v.InnerAddr, v.InnerPort, v.OuterAddr, v.OuterPort)
+			m, ok := metrics[m_k]
+			if !ok {
+				log.Printf("failed to get metric %s", m_k)
+			}
+			if m.LastPacketElapsedSecond > elapsed_sec {
+				m.LastPacketElapsedSecond = elapsed_sec
+			}
+			m.Outer2InnerPacketCount = v.PktCount
+			m.Outer2InnerOctetCount = v.OctCount
+			metrics[m_k] = m
 		}
 
-		for _, kc := range expiredKeyI2O {
-			err = objs.Inner2outerV4Icmp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
-			}
+		table := tablewriter.NewWriter(os.Stdout)
+		table.SetHeader([]string{"Protocol", "Inner", "Outer", "Endpoint", "Elapsed(sec)", "I2O Packet", "O2I Packet", "I2O bytes", "O2I bytes"})
+		keys := []string{}
+		for k := range metrics {
+			keys = append(keys, k)
 		}
-		for _, kc := range expiredKeyO2I {
-			err = objs.Outer2innerV4Icmp.Delete(kc)
-			if err != nil {
-				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			table.Append(metrics[k].ToStrings())
+		}
+		table.Render()
+
+		for _, v := range metrics {
+			if v.LastPacketElapsedSecond < 60 {
+				continue
+			}
+			tInner := V4TupleC{
+				Addr: IPv4ToUint32(v.InnerAddr),
+				Port: v.InnerPort,
+			}
+			tOuter := V4TupleC{
+				Addr: IPv4ToUint32(v.OuterAddr),
+				Port: v.OuterPort,
+			}
+			switch v.Protocol {
+			case "ICMP":
+				err = objs.Inner2outerV4Icmp.Delete(tInner)
+				if err != nil {
+					log.Printf("failed to delete %v from inner2outer_v4_icmp", tInner)
+				}
+				err = objs.Outer2innerV4Icmp.Delete(tOuter)
+				if err != nil {
+					log.Printf("failed to delete %v from outer2inner_v4_icmp", tOuter)
+				}
+			case "UDP":
+				err = objs.Inner2outerV4Udp.Delete(tInner)
+				if err != nil {
+					log.Printf("failed to delete %v from inner2outer_v4_udp", tInner)
+				}
+				err = objs.Outer2innerV4Udp.Delete(tOuter)
+				if err != nil {
+					log.Printf("failed to delete %v from outer2inner_v4_udp", tOuter)
+				}
+			case "TCP":
+				err = objs.Inner2outerV4Tcp.Delete(tInner)
+				if err != nil {
+					log.Printf("failed to delete %v from inner2outer_v4_tcp", tInner)
+				}
+				err = objs.Outer2innerV4Tcp.Delete(tOuter)
+				if err != nil {
+					log.Printf("failed to delete %v from outer2inner_v4_tcp", tOuter)
+				}
 			}
 		}
 	}
