@@ -76,7 +76,7 @@ struct v4_ct
 	__u32 outer_addr;
 
 	__u32 end_addr;
-	__u16 inner_port;
+	__u16 inner_port; // or id(for ICMP)
 	__u16 outer_port;
 
 	__u16 end_port;
@@ -140,6 +140,20 @@ struct bpf_map_def SEC("maps") reserved_port_v4_udp = {
 	.key_size = 0,
 	.value_size = sizeof(__u16),
 	.max_entries = 256};
+
+struct bpf_map_def SEC("maps") inner2outer_v4_icmp = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(struct v4_tuple),
+	.value_size = sizeof(struct v4_ct),
+	.max_entries = 1024,
+};
+
+struct bpf_map_def SEC("maps") outer2inner_v4_icmp = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(struct v4_tuple),
+	.value_size = sizeof(struct v4_ct),
+	.max_entries = 1024,
+};
 
 // static __always_inline __u16 csum_fold_helper(__u32 csum)
 //{
@@ -271,7 +285,66 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 	switch (proto)
 	{
 	case IPPROTO_ICMP:
-		return XDP_PASS;
+		if (icmphdr->type != ICMP_ECHO && icmphdr->type != ICMP_ECHOREPLY)
+		{
+			return XDP_PASS;
+		}
+		t.port = bpf_ntohs(icmphdr->un.echo.id);
+		ct = (struct v4_ct *)bpf_map_lookup_elem(&inner2outer_v4_icmp, &t);
+		if (ct == NULL)
+		{
+			memset(&fib_params, 0, sizeof(fib_params));
+			fib_params.family = AF_INET;
+			fib_params.tos = iphdr->tos;
+			fib_params.l4_protocol = iphdr->protocol;
+			fib_params.tot_len = bpf_ntohs(iphdr->tot_len);
+			fib_params.ipv4_src = iphdr->saddr;
+			fib_params.ipv4_dst = iphdr->daddr;
+			fib_params.ifindex = ctx->ingress_ifindex;
+
+			int rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+			if (rc != BPF_FIB_LKUP_RET_SUCCESS || fib_params.ifindex != c->outer_if_index)
+			{
+				return XDP_PASS;
+			}
+
+			struct v4_ct ct_new;
+			memset(&ct_new, 0, sizeof(ct_new));
+			ct_new.inner_addr = iphdr->saddr;
+			ct_new.outer_addr = c->outer_addr;
+			ct_new.end_addr = iphdr->daddr;
+			ct_new.inner_port = t.port;
+			ct_new.outer_port = t.port;
+			ct_new.type = NAT_TYPE_SYMMETRIC;
+			ct_new.pkt_count = 1;
+			ct_new.oct_count = ctx->data_end - ctx->data;
+			ct_new.ktime = bpf_ktime_get_ns();
+			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
+			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
+			memcpy(ct_new.outer_src_mac, fib_params.smac, ETH_ALEN);
+			memcpy(ct_new.outer_dst_mac, fib_params.dmac, ETH_ALEN);
+			res = bpf_map_update_elem(&inner2outer_v4_icmp, &t, &ct_new, BPF_ANY);
+			if (res < 0)
+			{
+				return XDP_DROP;
+			}
+
+			memset(&t2, 0, sizeof(t2));
+			t2.addr = ct_new.outer_addr;
+			t2.port = ct_new.outer_port;
+			res = bpf_map_update_elem(&outer2inner_v4_icmp, &t2, &ct_new, BPF_ANY);
+			if (res < 0)
+			{
+				return XDP_DROP;
+			}
+			ct = &ct_new;
+		}
+		else
+		{
+			ct->pkt_count += 1;
+			ct->oct_count += ctx->data_end - ctx->data;
+			ct->ktime = bpf_ktime_get_ns();
+		}
 		break;
 	case IPPROTO_UDP:
 		t.port = bpf_ntohs(udphdr->source);
@@ -310,7 +383,8 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			ct_new.outer_port = outer_port;
 			ct_new.end_port = bpf_ntohs(udphdr->dest);
 			ct_new.type = NAT_TYPE_SYMMETRIC;
-			ct_new.pkt_count = 0;
+			ct_new.pkt_count = 1;
+			ct_new.oct_count = ctx->data_end - ctx->data;
 			ct_new.ktime = bpf_ktime_get_ns();
 			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
 			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
@@ -332,11 +406,12 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			}
 			ct = &ct_new;
 		}
-		ct->pkt_count += 1;
-		ct->oct_count += ctx->data_end - ctx->data;
-		ct->ktime = bpf_ktime_get_ns();
-		memcpy(ethhdr->h_source, ct->outer_src_mac, ETH_ALEN);
-		memcpy(ethhdr->h_dest, ct->outer_dst_mac, ETH_ALEN);
+		else
+		{
+			ct->pkt_count += 1;
+			ct->oct_count += ctx->data_end - ctx->data;
+			ct->ktime = bpf_ktime_get_ns();
+		}
 
 		// update UDP header checksum
 		csum = ~udphdr->check;
@@ -350,22 +425,6 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 		csum = csum16_add(csum, (__u16)(ct->outer_addr >> 16));
 		csum = csum16_add(csum, (__u16)(ct->outer_addr));
 		udphdr->check = ~csum;
-
-		// update IP header checksum
-		csum = ~iphdr->check;
-		csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
-		csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
-
-		iphdr->saddr = ct->outer_addr;
-
-		csum = csum16_add(csum, (__u16)(iphdr->saddr >> 16));
-		csum = csum16_add(csum, (__u16)(iphdr->saddr));
-		iphdr->check = ~csum;
-
-		// decrease ip ttl
-		ip_decrease_ttl(iphdr);
-
-		return bpf_redirect(c->outer_if_index, 0);
 		break;
 	case IPPROTO_TCP:
 		t.port = bpf_ntohs(tcphdr->source);
@@ -418,7 +477,8 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			ct_new.outer_port = outer_port;
 			ct_new.end_port = bpf_ntohs(tcphdr->dest);
 			ct_new.type = NAT_TYPE_SYMMETRIC;
-			ct_new.pkt_count = 0;
+			ct_new.pkt_count = 1;
+			ct_new.oct_count = ctx->data_end - ctx->data;
 			ct_new.ktime = bpf_ktime_get_ns();
 			memcpy(ct_new.inner_src_mac, ethhdr->h_dest, ETH_ALEN);
 			memcpy(ct_new.inner_dst_mac, ethhdr->h_source, ETH_ALEN);
@@ -478,47 +538,43 @@ int xdp_nat_inner2outer_func(struct xdp_md *ctx)
 			{
 				st->state = NAT_STATE_TCP_ESTABLISHED;
 			}
+
+			// update TCP header checksum
+			csum = ~tcphdr->check;
+			csum = csum16_add(csum, ~tcphdr->source);
+			csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
+			csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
+
+			tcphdr->source = bpf_htons(ct->outer_port);
+
+			csum = csum16_add(csum, tcphdr->source);
+			csum = csum16_add(csum, (__u16)(ct->outer_addr >> 16));
+			csum = csum16_add(csum, (__u16)(ct->outer_addr));
+			tcphdr->check = ~csum;
 		}
-		ct->pkt_count += 1;
-		ct->oct_count += ctx->data_end - ctx->data;
-		ct->ktime = bpf_ktime_get_ns();
 
-		memcpy(ethhdr->h_source, ct->outer_src_mac, ETH_ALEN);
-		memcpy(ethhdr->h_dest, ct->outer_dst_mac, ETH_ALEN);
-
-		// update TCP header checksum
-		csum = ~tcphdr->check;
-		csum = csum16_add(csum, ~tcphdr->source);
-		csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
-		csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
-
-		tcphdr->source = bpf_htons(ct->outer_port);
-
-		csum = csum16_add(csum, tcphdr->source);
-		csum = csum16_add(csum, (__u16)(ct->outer_addr >> 16));
-		csum = csum16_add(csum, (__u16)(ct->outer_addr));
-		tcphdr->check = ~csum;
-
-		// update IP header checksum
-		csum = ~iphdr->check;
-		csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
-		csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
-
-		iphdr->saddr = ct->outer_addr;
-
-		csum = csum16_add(csum, (__u16)(iphdr->saddr >> 16));
-		csum = csum16_add(csum, (__u16)(iphdr->saddr));
-		iphdr->check = ~csum;
-
-		// decrease ip ttl
-		ip_decrease_ttl(iphdr);
-
-		return bpf_redirect(c->outer_if_index, 0);
 		break;
 	default:
 		return XDP_DROP;
 	}
-	return XDP_PASS;
+	memcpy(ethhdr->h_source, ct->outer_src_mac, ETH_ALEN);
+	memcpy(ethhdr->h_dest, ct->outer_dst_mac, ETH_ALEN);
+
+	// update IP header checksum
+	csum = ~iphdr->check;
+	csum = csum16_add(csum, ~(__u16)(iphdr->saddr >> 16));
+	csum = csum16_add(csum, ~(__u16)(iphdr->saddr));
+
+	iphdr->saddr = ct->outer_addr;
+
+	csum = csum16_add(csum, (__u16)(iphdr->saddr >> 16));
+	csum = csum16_add(csum, (__u16)(iphdr->saddr));
+	iphdr->check = ~csum;
+
+	// decrease ip ttl
+	ip_decrease_ttl(iphdr);
+
+	return bpf_redirect(c->outer_if_index, 0);
 }
 
 SEC("xdp_nat_outer2inner")
@@ -555,7 +611,16 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 	switch (proto)
 	{
 	case IPPROTO_ICMP:
-		return XDP_PASS;
+		if (icmphdr->type != ICMP_ECHO && icmphdr->type != ICMP_ECHOREPLY)
+		{
+			return XDP_PASS;
+		}
+		t.port = bpf_ntohs(icmphdr->un.echo.id);
+		ct = (struct v4_ct *)bpf_map_lookup_elem(&outer2inner_v4_icmp, &t);
+		if (ct == NULL)
+		{
+			return XDP_PASS;
+		}
 		break;
 	case IPPROTO_UDP:
 		t.port = bpf_ntohs(udphdr->dest);
@@ -576,10 +641,6 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 			return XDP_DROP;
 		}
 
-		ct->ktime = bpf_ktime_get_ns();
-		memcpy(ethhdr->h_source, ct->inner_src_mac, ETH_ALEN);
-		memcpy(ethhdr->h_dest, ct->inner_dst_mac, ETH_ALEN);
-
 		// update UDP header checksum
 		csum = ~udphdr->check;
 		csum = csum16_add(csum, ~udphdr->dest);
@@ -593,21 +654,6 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 		csum = csum16_add(csum, (__u16)(ct->inner_addr));
 		udphdr->check = ~csum;
 
-		// update IP header checksum
-		csum = ~iphdr->check;
-		csum = csum16_add(csum, ~(__u16)(iphdr->daddr >> 16));
-		csum = csum16_add(csum, ~(__u16)(iphdr->daddr));
-
-		iphdr->daddr = ct->inner_addr;
-
-		csum = csum16_add(csum, (__u16)(iphdr->daddr >> 16));
-		csum = csum16_add(csum, (__u16)(iphdr->daddr));
-		iphdr->check = ~csum;
-
-		// decrease ip ttl
-		ip_decrease_ttl(iphdr);
-
-		return bpf_redirect(c->inner_if_index, 0);
 		break;
 	case IPPROTO_TCP:
 		t.port = bpf_ntohs(tcphdr->dest);
@@ -616,55 +662,53 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 		{
 			return XDP_PASS;
 		}
-		else
-		{
-			struct v4_tuple t2;
-			memset(&t2, 0, sizeof(t2));
-			t2.addr = ct->inner_addr;
-			t2.port = ct->inner_port;
-			struct state *st = (struct state *)bpf_map_lookup_elem(&state_v4_tcp, &t2);
-			if (st == NULL)
-			{
-				return XDP_DROP;
-			}
-			if (st->state == NAT_STATE_TCP_RESET || st->state == NAT_STATE_TCP_CLOSED)
-			{
-				return XDP_DROP;
-			}
 
-			if (tcphdr->rst)
+		struct v4_tuple t2;
+		memset(&t2, 0, sizeof(t2));
+		t2.addr = ct->inner_addr;
+		t2.port = ct->inner_port;
+		struct state *st = (struct state *)bpf_map_lookup_elem(&state_v4_tcp, &t2);
+		if (st == NULL)
+		{
+			return XDP_DROP;
+		}
+		if (st->state == NAT_STATE_TCP_RESET || st->state == NAT_STATE_TCP_CLOSED)
+		{
+			return XDP_DROP;
+		}
+
+		if (tcphdr->rst)
+		{
+			st->state = NAT_STATE_TCP_RESET;
+		}
+		if (tcphdr->fin)
+		{
+			if (st->state == NAT_STATE_TCP_WAIT_OUTER_FIN2)
 			{
-				st->state = NAT_STATE_TCP_RESET;
+				st->state = NAT_STATE_TCP_RECV_OUTER_FIN2;
 			}
-			if (tcphdr->fin)
+			else
 			{
-				if (st->state == NAT_STATE_TCP_WAIT_OUTER_FIN2)
-				{
-					st->state = NAT_STATE_TCP_RECV_OUTER_FIN2;
-				}
-				else
-				{
-					st->state = NAT_STATE_TCP_RECV_OUTER_FIN;
-				}
+				st->state = NAT_STATE_TCP_RECV_OUTER_FIN;
 			}
-			else if (st->state == NAT_STATE_TCP_RECV_INNER_FIN && tcphdr->ack)
+		}
+		else if (st->state == NAT_STATE_TCP_RECV_INNER_FIN && tcphdr->ack)
+		{
+			st->state = NAT_STATE_TCP_WAIT_OUTER_FIN2;
+		}
+		else if (st->state == NAT_STATE_TCP_RECV_INNER_FIN2 && tcphdr->ack)
+		{
+			st->state = NAT_STATE_TCP_CLOSED;
+		}
+		else if (st->state == NAT_STATE_TCP_RECV_SYN)
+		{
+			if (tcphdr->syn && tcphdr->ack)
 			{
-				st->state = NAT_STATE_TCP_WAIT_OUTER_FIN2;
+				st->state = NAT_STATE_TCP_RECV_SYN_ACK;
 			}
-			else if (st->state == NAT_STATE_TCP_RECV_INNER_FIN2 && tcphdr->ack)
+			else
 			{
-				st->state = NAT_STATE_TCP_CLOSED;
-			}
-			else if (st->state == NAT_STATE_TCP_RECV_SYN)
-			{
-				if (tcphdr->syn && tcphdr->ack)
-				{
-					st->state = NAT_STATE_TCP_RECV_SYN_ACK;
-				}
-				else
-				{
-					return XDP_DROP;
-				}
+				return XDP_DROP;
 			}
 		}
 
@@ -680,10 +724,6 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 			return XDP_DROP;
 		}
 
-		ct->ktime = bpf_ktime_get_ns();
-		memcpy(ethhdr->h_source, ct->inner_src_mac, ETH_ALEN);
-		memcpy(ethhdr->h_dest, ct->inner_dst_mac, ETH_ALEN);
-
 		// update TCP header checksum
 		csum = ~tcphdr->check;
 		csum = csum16_add(csum, ~tcphdr->dest);
@@ -697,26 +737,33 @@ int xdp_nat_outer2inner_func(struct xdp_md *ctx)
 		csum = csum16_add(csum, (__u16)(ct->inner_addr));
 		tcphdr->check = ~csum;
 
-		// update IP header checksum
-		csum = ~iphdr->check;
-		csum = csum16_add(csum, ~(__u16)(iphdr->daddr >> 16));
-		csum = csum16_add(csum, ~(__u16)(iphdr->daddr));
-
-		iphdr->daddr = ct->inner_addr;
-
-		csum = csum16_add(csum, (__u16)(iphdr->daddr >> 16));
-		csum = csum16_add(csum, (__u16)(iphdr->daddr));
-		iphdr->check = ~csum;
-
-		// decrease ip ttl
-		ip_decrease_ttl(iphdr);
-
-		return bpf_redirect(c->inner_if_index, 0);
 		break;
 	default:
 		return XDP_DROP;
 	}
-	return XDP_PASS;
+
+	memcpy(ethhdr->h_source, ct->inner_src_mac, ETH_ALEN);
+	memcpy(ethhdr->h_dest, ct->inner_dst_mac, ETH_ALEN);
+
+	// update IP header checksum
+	csum = ~iphdr->check;
+	csum = csum16_add(csum, ~(__u16)(iphdr->daddr >> 16));
+	csum = csum16_add(csum, ~(__u16)(iphdr->daddr));
+
+	iphdr->daddr = ct->inner_addr;
+
+	csum = csum16_add(csum, (__u16)(iphdr->daddr >> 16));
+	csum = csum16_add(csum, (__u16)(iphdr->daddr));
+	iphdr->check = ~csum;
+
+	// decrease ip ttl
+	ip_decrease_ttl(iphdr);
+
+	ct->pkt_count += 1;
+	ct->oct_count += ctx->data_end - ctx->data;
+	ct->ktime = bpf_ktime_get_ns();
+
+	return bpf_redirect(c->inner_if_index, 0);
 }
 
 char _license[] SEC("license") = "GPL";

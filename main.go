@@ -330,6 +330,62 @@ func main() {
 				log.Fatalf("could not put reserved port: %s", err)
 			}
 		}
+
+		expiredKeyI2O = make([]V4TupleC, 0)
+		expiredKeyO2I = make([]V4TupleC, 0)
+		t, err = readNatTable(objs.Inner2outerV4Icmp)
+		if err != nil {
+			log.Printf("Error reading map: %s", err)
+			continue
+		}
+		log.Println("Inner2outer_v4ICMP:")
+		for kc, vc := range t {
+			k := kc.ToGo()
+			v := vc.ToGo()
+			elapsed_nano := unix_nano - v.KTime
+			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
+			log.Printf(" InnerAddr=%s =>", k.Addr)
+			log.Printf("   innerAddr=%s outerAddr=%s endAddr=%s id=0x%04x pktCount=%x elapsed=%d\n", v.InnerAddr, v.OuterAddr, v.EndAddr, v.InnerPort, v.PktCount, elapsed_sec)
+			log.Printf("   innerSrcMAC=%s innerDstMAC=%s outerSrcMAC=%s outerDstMAC=%s\n", v.InnerSrcMAC, v.InnerDstMAC, v.OuterSrcMAC, v.OuterDstMAC)
+			log.Printf("   pktCount=%d octCount=%d elapsed=%d\n", v.PktCount, v.OctCount, elapsed_sec)
+			if elapsed_sec > 10 {
+				expiredKeyI2O = append(expiredKeyI2O, kc)
+				k2 := V4TupleC{
+					Addr: vc.OuterAddr,
+					Port: vc.OuterPort,
+				}
+				expiredKeyO2I = append(expiredKeyO2I, k2)
+			}
+		}
+
+		t, err = readNatTable(objs.Outer2innerV4Icmp)
+		if err != nil {
+			log.Printf("Error reading map: %s", err)
+			continue
+		}
+		log.Println("Outer2inner_v4ICMP:")
+		for kc, vc := range t {
+			k := kc.ToGo()
+			v := vc.ToGo()
+			elapsed_nano := unix_nano - v.KTime
+			elapsed_sec := elapsed_nano / (1000 * 1000 * 1000)
+			log.Printf(" OuterAddr=%s =>", k.Addr)
+			log.Printf("   innerAddr=%s outerAddr=%s id=0x%04X pktCount=%x elapsed=%d\n", v.InnerAddr, v.OuterAddr, v.OuterPort, v.PktCount, elapsed_sec)
+			log.Printf("   pktCount=%d octCount=%d elapsed=%d\n", v.PktCount, v.OctCount, elapsed_sec)
+		}
+
+		for _, kc := range expiredKeyI2O {
+			err = objs.Inner2outerV4Icmp.Delete(kc)
+			if err != nil {
+				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
+			}
+		}
+		for _, kc := range expiredKeyO2I {
+			err = objs.Outer2innerV4Icmp.Delete(kc)
+			if err != nil {
+				log.Printf("failed to delete key %q from outer2inner err=%s", kc, err)
+			}
+		}
 	}
 }
 
