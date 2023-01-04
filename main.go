@@ -130,6 +130,7 @@ type Metric struct {
 	OuterPort               uint16
 	EndpointAddr            net.IP
 	EndpointPort            uint16
+	Misc                    string
 	LastPacketElapsedSecond int
 	Inner2OuterPacketCount  uint64
 	Inner2OuterOctetCount   uint64
@@ -143,6 +144,7 @@ func (m Metric) ToStrings() []string {
 	res = append(res, fmt.Sprintf("%s:%d", m.InnerAddr, m.InnerPort))
 	res = append(res, fmt.Sprintf("%s:%d", m.OuterAddr, m.OuterPort))
 	res = append(res, fmt.Sprintf("%s:%d", m.EndpointAddr, m.EndpointPort))
+	res = append(res, m.Misc)
 	res = append(res, fmt.Sprintf("%d", m.LastPacketElapsedSecond))
 	res = append(res, fmt.Sprintf("%d", m.Inner2OuterPacketCount))
 	res = append(res, fmt.Sprintf("%d", m.Outer2InnerPacketCount))
@@ -257,6 +259,7 @@ func main() {
 				OuterPort:               v.OuterPort,
 				EndpointAddr:            v.EndAddr,
 				EndpointPort:            v.EndPort,
+				Misc:                    fmt.Sprintf("State=%d", state),
 				Inner2OuterPacketCount:  v.PktCount,
 				Inner2OuterOctetCount:   v.OctCount,
 				LastPacketElapsedSecond: int(elapsed_sec),
@@ -349,6 +352,7 @@ func main() {
 				OuterPort:               v.OuterPort,
 				EndpointAddr:            v.EndAddr,
 				EndpointPort:            v.EndPort,
+				Misc:                    fmt.Sprintf("ID=0x%04X", v.InnerPort),
 				Inner2OuterPacketCount:  v.PktCount,
 				Inner2OuterOctetCount:   v.OctCount,
 				LastPacketElapsedSecond: int(elapsed_sec),
@@ -378,7 +382,7 @@ func main() {
 		}
 
 		table := tablewriter.NewWriter(os.Stdout)
-		table.SetHeader([]string{"Protocol", "Inner", "Outer", "Endpoint", "Elapsed(sec)", "I2O Packet", "O2I Packet", "I2O bytes", "O2I bytes"})
+		table.SetHeader([]string{"Protocol", "Inner", "Outer", "Endpoint", "Misc", "Elapsed(sec)", "I2O Packet", "O2I Packet", "I2O bytes", "O2I bytes"})
 		keys := []string{}
 		for k := range metrics {
 			keys = append(keys, k)
@@ -391,7 +395,7 @@ func main() {
 		table.Render()
 
 		for _, v := range metrics {
-			if v.LastPacketElapsedSecond < 60 {
+			if v.LastPacketElapsedSecond < 10 {
 				continue
 			}
 			tInner := V4TupleC{
@@ -421,6 +425,10 @@ func main() {
 				if err != nil {
 					log.Printf("failed to delete %v from outer2inner_v4_udp", tOuter)
 				}
+				err = objs.ReservedPortV4Udp.Put(nil, tOuter.Port)
+				if err != nil {
+					log.Printf("failed to put %q to reserved_port_v4_udp", tOuter.Port)
+				}
 			case "TCP":
 				err = objs.Inner2outerV4Tcp.Delete(tInner)
 				if err != nil {
@@ -429,6 +437,14 @@ func main() {
 				err = objs.Outer2innerV4Tcp.Delete(tOuter)
 				if err != nil {
 					log.Printf("failed to delete %v from outer2inner_v4_tcp", tOuter)
+				}
+				err = objs.StateV4Tcp.Delete(tInner)
+				if err != nil {
+					log.Printf("failed to delete %v from state_v4_tcp", tOuter)
+				}
+				err = objs.ReservedPortV4Tcp.Put(nil, tOuter.Port)
+				if err != nil {
+					log.Printf("failed to put %q to reserved_port_v4_tcp", tOuter.Port)
 				}
 			}
 		}
